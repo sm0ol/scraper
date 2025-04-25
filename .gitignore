@@ -32,3 +32,5 @@ Thumbs.db
 coverage 
 
 *.txt
+*.md
+*.xml

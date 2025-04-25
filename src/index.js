@@ -2,84 +2,139 @@ import { JSDOM } from 'jsdom';
 import fetch from 'node-fetch';
 import TurndownService from 'turndown';
 import fs from 'fs/promises';
+import path from 'path';
 
 const sitemapUrl = 'https://jacksonswash.com/page-sitemap.xml';
 const turndownService = new TurndownService();
 
-// Configure turndown to handle links as plain text
-turndownService.addRule('plainLink', {
+// Define output directories
+const textOutputDir = 'scraped_text';
+const markdownOutputDir = 'scraped_markdown';
+const xmlOutputDir = 'scraped_xml';
+
+// Configure turndown to handle links
+turndownService.addRule('linkWithUrl', {
   filter: 'a',
-  replacement: function (content) {
-    return content; // Return only the link's text content
+  replacement: function (content, node) {
+    const href = node.getAttribute('href') || '';
+    // Restore original user edit: Output standard markdown links
+    return href ? `[${content.trim()}](${href})`.trim() : content;
   }
 });
 
-// Function to fetch and extract relevant HTML and text from a single URL
+// Function to fetch content
 async function getContentFromUrl(url) {
-  console.log(`Processing: ${url}`); // Log progress
+  console.log(`Processing: ${url}`);
   try {
     const dom = await JSDOM.fromURL(url);
     const { document } = dom.window;
+    const title = document.querySelector('title')?.textContent || 'No Title Found';
 
-    // Remove script and style elements
     document.querySelectorAll('script, style').forEach(el => el.remove());
+    // Apply user's previous edit to remove forms
+    document.querySelectorAll('header, nav, button, footer, noscript, form').forEach(el => el.remove());
+    document.querySelectorAll(
+      '.modal, .dropdown, .popup, .tooltip, [hidden], [aria-hidden="true"], .hidden'
+    ).forEach(el => el.remove());
 
-    // Remove common boilerplate/navigation elements
-    // Added noscript as it often contains duplicate or fallback content
-    document.querySelectorAll('header, nav, button, footer, noscript').forEach(el => el.remove());
-
-    // Get the relevant HTML content
     const relevantHtml = document.body.innerHTML || "";
-
-    // Get text content from the remaining body
     let relevantText = document.body.textContent || "";
-
-    // Clean up whitespace (replace multiple spaces/newlines with single space, trim)
     relevantText = relevantText.replace(/\s+/g, ' ').trim();
 
-    return { html: relevantHtml, text: relevantText }; // Return both HTML and text
+    return { html: relevantHtml, text: relevantText, title: title };
   } catch (error) {
     console.error(`Error processing ${url}: ${error.message}`);
-    return { html: "", text: "" }; // Return empty object on error
+    return { html: "", text: "", title: "Error Fetching Title" };
   }
 }
 
-// Function to process a single URL and save output
-async function processSingleUrl(url) {
-  console.log(`Processing single URL: ${url}`);
-  const { html, text } = await getContentFromUrl(url);
+// Helper function to sanitize URL for filename (accepts extension)
+function sanitizeUrlForFilename(url, extension) {
+  return url
+    .replace(/^https?:\/\//, '')
+    .replace(/[^a-zA-Z0-9_\-\.]/g, '_')
+    .replace(/_+/g, '_')
+    .replace(/\.$/, '') // Remove trailing dot if any
+    + extension; // Use provided extension
+}
 
-  if (!html) {
+// Generic function to save content to a file in a specific directory
+async function saveContentToFile(outputDir, url, content, extension, fileTypeLabel) {
+  const filename = sanitizeUrlForFilename(url, extension);
+  const filepath = path.join(outputDir, filename);
+
+  try {
+    await fs.mkdir(outputDir, { recursive: true });
+    await fs.writeFile(filepath, content, 'utf8');
+    console.log(`${fileTypeLabel} content saved to ${filepath}`);
+  } catch (writeError) {
+    console.error(`Failed to write ${fileTypeLabel} file ${filepath}: ${writeError.message}`);
+  }
+}
+
+// Specific save functions using the generic one
+async function savePageAsText(url, textContent) {
+  await saveContentToFile(textOutputDir, url, textContent, '.txt', 'Text');
+}
+
+async function savePageAsMarkdown(url, markdownContent) {
+  await saveContentToFile(markdownOutputDir, url, markdownContent, '.md', 'Markdown');
+}
+
+async function savePageAsXml(url, title, markdownContent) {
+  const filename = sanitizeUrlForFilename(url, '.xml');
+  const filepath = path.join(xmlOutputDir, filename);
+  const escapedTitle = title.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  const escapedLink = url.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+  const xmlContent = `
+<page>
+  <link>${escapedLink}</link>
+  <title>${escapedTitle}</title>
+  <content><![CDATA[
+${markdownContent}
+  ]]></content>
+</page>
+`.trim();
+
+  await saveContentToFile(xmlOutputDir, url, xmlContent, '.xml', 'XML');
+}
+
+
+// Function to process a single URL and save outputs
+async function processSingleUrl(url) {
+  console.log(`\nProcessing single URL: ${url}`);
+  const { html, text, title } = await getContentFromUrl(url);
+
+  if (!html && !text) {
     console.error(`Failed to retrieve content from ${url}`);
     return;
   }
 
   const markdown = turndownService.turndown(html);
 
-  try {
-    await fs.writeFile('scraped-content.txt', text, 'utf8');
-    console.log('\nText content has been saved to scraped-content.txt');
-  } catch (writeError) {
-    console.error(`Failed to write text file: ${writeError.message}`);
-  }
+  // Save individual files
+  await savePageAsText(url, text);
+  await savePageAsMarkdown(url, markdown);
+  await savePageAsXml(url, title, markdown);
 
-  try {
-    await fs.writeFile('scraped-content.md', markdown, 'utf8');
-    console.log('\nMarkdown content has been saved to scraped-content.md');
-  } catch (writeError) {
-    console.error(`Failed to write markdown file: ${writeError.message}`);
-  }
-  console.log("\n\n=== Text Content ===\n");
+  // Log snippets (optional)
+  console.log("\n=== Text Content (First 500 chars) ===\n");
   console.log(text.substring(0, 500) + '...');
-  console.log("\n\n=== Markdown Content ===\n");
+  console.log("\n=== Markdown Content (First 500 chars) ===\n");
   console.log(markdown.substring(0, 500) + '...');
 }
 
-// Function to process the sitemap (modified to reuse getContentFromUrl)
+
+// Function to process the sitemap and save individual files
 async function processSitemap() {
-  let allText = "";
-  let allMarkdown = "";
+  console.log('\nProcessing sitemap...');
   try {
+    // Ensure output directories exist (optional, save functions do it too)
+    await fs.mkdir(textOutputDir, { recursive: true });
+    await fs.mkdir(markdownOutputDir, { recursive: true });
+    await fs.mkdir(xmlOutputDir, { recursive: true });
+
     const response = await fetch(sitemapUrl);
     if (!response.ok) {
       throw new Error(`Failed to fetch sitemap: ${response.statusText}`);
@@ -96,35 +151,17 @@ async function processSitemap() {
     console.log(`Found ${pageUrls.length} unique page URLs in sitemap.`);
 
     for (const url of pageUrls) {
-      const { html: pageHtml, text: pageText } = await getContentFromUrl(url);
-      if (pageHtml) {
+      const { html: pageHtml, text: pageText, title: pageTitle } = await getContentFromUrl(url);
+      if (pageHtml || pageText) { // Process if we got any content
         const pageMarkdown = turndownService.turndown(pageHtml);
-        allText += `\n\n--- Page: ${url} ---\n\n`;
-        allText += pageText;
-        allMarkdown += `\n\n--- Page: ${url} ---\n\n`;
-        allMarkdown += pageMarkdown;
+
+        // Save individual files for this page
+        await savePageAsText(url, pageText);
+        await savePageAsMarkdown(url, pageMarkdown);
+        await savePageAsXml(url, pageTitle, pageMarkdown);
       }
     }
-
-    console.log("\n\n=== Combined Text Content ===\n");
-    console.log(allText.substring(0, 500) + '...');
-
-    console.log("\n\n=== Combined Markdown Content ===\n");
-    console.log(allMarkdown.substring(0, 500) + '...');
-
-    try {
-      await fs.writeFile('scraped-content.txt', allText, 'utf8');
-      console.log('\nText content has been saved to scraped-content.txt');
-    } catch (writeError) {
-      console.error(`Failed to write text file: ${writeError.message}`);
-    }
-
-    try {
-      await fs.writeFile('scraped-content.md', allMarkdown, 'utf8');
-      console.log('\nMarkdown content has been saved to scraped-content.md');
-    } catch (writeError) {
-      console.error(`Failed to write markdown file: ${writeError.message}`);
-    }
+    console.log("\nSitemap processing finished.");
 
   } catch (error) {
     console.error(`Failed to process sitemap: ${error.message}`);
@@ -133,20 +170,18 @@ async function processSitemap() {
 
 // Main execution logic
 async function main() {
-  const args = process.argv.slice(2); // Get command line arguments, excluding node and script path
-  const singleUrl = args[0]; // Assume the first argument is the URL
+  const args = process.argv.slice(2);
+  const singleUrl = args[0];
 
   if (singleUrl) {
-    // Validate if it looks like a URL (basic check)
     if (singleUrl.startsWith('http://') || singleUrl.startsWith('https://')) {
       await processSingleUrl(singleUrl);
     } else {
-      console.error('Invalid URL provided as argument. Please provide a full URL starting with http:// or https://');
+      console.error('Invalid URL provided. Please start with http:// or https://');
     }
   } else {
-    console.log('No URL provided, processing sitemap...');
     await processSitemap();
   }
 }
 
-main(); // Call the main function
+main();
